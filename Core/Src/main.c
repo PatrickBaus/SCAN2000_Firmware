@@ -35,6 +35,18 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+// if LOG_DEBUG_MESSAGES is set:
+// * logs some additional debug info
+// * uses a rather long clock signal idle timeout 
+// * lights the Activity led only during interrupt handler activity, so you can use it 
+//   investigate interrupt handling duration (and hangs) 
+// When not set, the activity led toggles ar each received message.
+#define LOG_DEBUG_MESSAGES
+
+// stupid workaround since printing uint64_t with %llx results in "lx" to be printed
+#define PRI_UINT64_C_Val(value) ((unsigned long) (value>>32)),((unsigned long)value)
+#define PRI_UINT64 "%08lx %08lx"
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,17 +59,50 @@ UART_HandleTypeDef huart4;
 DMA_HandleTypeDef hdma_usart4_tx;
 
 /* USER CODE BEGIN PV */
-uint32_t timeSinceLastClock = 0;
+// set by both the interrupt handler and the main loop, used by the main loop
+volatile uint32_t timeSinceLastClock = 0;
+// below are all maintained and used by the interrupt handler. 
 uint64_t receivedSequence = 0;
-uint8_t receivedCounter = 0;
+volatile uint8_t receivedCounter = 0; // also read by the main loop
 uint32_t channelState = 0;
-uint8_t uartsinglemessage[71], uartbuffer[2000], uartTransmitBuffer[2000];
 
-GPIO_TypeDef* GPIOsequence[] = {CH1_GPIO_Port, CH2_GPIO_Port, CH3_GPIO_Port, CH4_GPIO_Port, CH5_GPIO_Port, CH6_GPIO_Port, CH7_GPIO_Port, CH8_GPIO_Port, CH9_GPIO_Port, CH10_GPIO_Port, CH11_GPIO_Port, CH12_GPIO_Port, CH13_GPIO_Port, CH4_GPIO_Port, CH5_GPIO_Port, CH6_GPIO_Port, CH7_GPIO_Port, CH18_GPIO_Port, CH19_GPIO_Port, CH12_GPIO_Port};
-uint32_t PinSequence[] = {CH1_Pin, CH2_Pin, CH3_Pin, CH4_Pin, CH5_Pin, CH6_Pin, CH7_Pin, CH8_Pin, CH9_Pin, CH10_Pin, CH11_Pin, CH12_Pin, CH13_Pin, CH14_Pin, CH15_Pin, CH16_Pin, CH17_Pin, CH18_Pin, CH19_Pin, CH20_Pin};
-uint8_t scan2000_20ChannelSequence[] = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1, 2, 3, 4, 5, 6, 7 , 8, 9, 10, 21, 22};    // CH11..CH20, CH1..CH10, Bank 2 to OUT, Bank 2 to 4W
+// This is where the pins are. This is not used for the init, so if you change anything, also change in the init.
+#define NR_CHANNELS 20
+GPIO_TypeDef* GPIOsequence[NR_CHANNELS] = {CH1_GPIO_Port, CH2_GPIO_Port, CH3_GPIO_Port, CH4_GPIO_Port, CH5_GPIO_Port, CH6_GPIO_Port, CH7_GPIO_Port, CH8_GPIO_Port, CH9_GPIO_Port, CH10_GPIO_Port, CH11_GPIO_Port, CH12_GPIO_Port, CH13_GPIO_Port, CH14_GPIO_Port, CH15_GPIO_Port, CH16_GPIO_Port, CH17_GPIO_Port, CH18_GPIO_Port, CH19_GPIO_Port, CH20_GPIO_Port};
+uint32_t PinSequence[NR_CHANNELS] = {CH1_Pin, CH2_Pin, CH3_Pin, CH4_Pin, CH5_Pin, CH6_Pin, CH7_Pin, CH8_Pin, CH9_Pin, CH10_Pin, CH11_Pin, CH12_Pin, CH13_Pin, CH14_Pin, CH15_Pin, CH16_Pin, CH17_Pin, CH18_Pin, CH19_Pin, CH20_Pin};
+
+// channelState is 32 bit, and is organised in sequence: 0 = CH1 ... 19=CH20, 20 = 4W
+// The following bitmasks are for the channelState
+#define CHANNELSTATE_BITMASK_BANK1 0x003FF
+#define CHANNELSTATE_BITMASK_BANK2 0xFFC00
+#define CHANNELSTATE_BITMASK_4W 0x100000
+
+#define SCAN2000_20_BITS 24
+// This is the sequence of the command on a -20 board. 2 bits per channel. Even bits turn off, odd bits turn on.
+// The command is 48 bits (24 relays), but only the first 21 are used: 20 channels (banks inverted), plus 4W. The "Bank 2 to OUT", "Bank 2 to 4W" are derived from that 4W bit.
+// This array lists the use of the bits for the channels: 1..20 for the channels, 21 for the 4W, 22..24 for spare (future-proof debugging)
+uint8_t scan2000_20ChannelSequence[SCAN2000_20_BITS] = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1, 2, 3, 4, 5, 6, 7 , 8, 9, 10, 21, 22, 23, 24};    // CH11..CH20, CH1..CH10, 4W, 3 spares
+
+#define BITS_FOR_SCAN2000_STD 12
+// TODO test and finalise this
 uint8_t scan2000ChannelOffSequence[] = {17, 19, 21, 23, 8, 14, 0, 2, 4, 5, 12};      // CH1..CH10, 4W
 uint8_t scan2000ChannelOnSequence[] = {16, 18, 20, 22, 9, 13, 15, 1, 3, 6, 11};      // CH1..CH10, 4W
+
+
+// The interrupt handler IS NOT ALLOWED TO BLOCK. Therefore, I log my messages in a buffer that I print out from the main loop.
+struct msgInfo {
+  enum {msgUnknown = 0, msgOK, msgIgnored, msgLengthError, msgDataError, msgRelayError} state;
+  uint8_t receivedCounter;
+  uint64_t receivedSequence;
+  uint32_t channelState;
+  uint32_t timestamp;
+};
+
+// circular buffer for messages, used between interrupt handler and main loop
+struct msgInfo msgBuffer[256]; // MUST BE 256 (or more), uint8_t max. Just forgot what is the preprocessor define for that.
+volatile uint8_t msgReadLevel; // to be set only from the main loop.
+volatile uint8_t msgWriteLevel; // to be set only from the interrupt handler
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,7 +111,11 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART4_UART_Init(void);
 /* USER CODE BEGIN PFP */
-void UARTSendDMA(void);
+
+static void MsgBuffer_Init(void);
+static void MsgBuffer_add(struct msgInfo msg); // to be called only from the interrupt handler
+static void MsgBuffer_print(void);
+
 #ifdef __GNUC__
 /* With GCC/RAISONANCE, small printf (option LD Linker->Libraries->Small printf
    set to 'Yes') calls __io_putchar() */
@@ -112,30 +161,80 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART4_UART_Init();
+  MsgBuffer_Init();
   /* USER CODE BEGIN 2 */
   //__HAL_DMA_DISABLE_IT(huart4.hdmarx, DMA_IT_HT); // Disable Half Transfer Interrupt
-  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);  // turn on the LED, the logic is inverted
-  printf("\n===============\nBooting\n");
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);  // turn on the LED
+  printf("\n===============\nBooting, SCAN2000-20 FW version " FW_VERSION "\n");
   for (uint8_t i=0; i < 6; i++) {
     HAL_Delay(100); // sleep for 100 ms
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
   }
-  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET); // led off
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+  /* USER CODE BEGIN 3 */
+#ifdef LOG_DEBUG_MESSAGES   
+  printf("Log level: DEBUG\n");
+#endif 
+
+  // local variables for the idle detection loop
+  uint32_t old_timeSinceLastClock;
+  uint32_t now_timeSinceLastClock;
+  uint8_t old_receivedCounter;
+  uint8_t now_receivedCounter;   
+  now_timeSinceLastClock = timeSinceLastClock;
+  now_receivedCounter = receivedCounter;
+  old_timeSinceLastClock = now_timeSinceLastClock;
+  old_receivedCounter = now_receivedCounter;
+
   while (1)
   {
-    uint32_t now = HAL_GetTick();
-    if (HAL_GetTick() - timeSinceLastClock > 1) {
-        receivedCounter = 0;
-        receivedSequence = 0;
-        timeSinceLastClock = now;
-    }
-    /* USER CODE END WHILE */
+    MsgBuffer_print();
+     
+    // Detect idle situations
+    // Normally clock period is 10us, and strobe follows within 20us.
+    // The handling of the clock and strobe, and the update of timeSinceLastClock 
+    // is inside the interrupt handler (HAL_GPIO_EXTI_Rising_Callback)
+    // TODO: For some reason, if I do not print idle messages, the MsgBuffer_print does not print. Fix that.
+#ifdef LOG_DEBUG_MESSAGES
+// 5 sec idle timeout for debugging
+#define IDLE_TIMEOUT 5000
 
-    /* USER CODE BEGIN 3 */
+    // The following is a bit strange. Since I base my idle state on variables that are maintained
+    // in the interrupt handler, and there are no atomic operations on those variables, and 
+    // there is no sync or lock between the interrupt handler and the main loop, the variables read here
+    // can be changed while reading, and therefore can be wrong.
+    // To avoid that, I just read them 2 times, and if both reads are the same, then they should be OK.
+    // 
+    // first hold on to old values
+    old_timeSinceLastClock = now_timeSinceLastClock;
+    old_receivedCounter = now_receivedCounter;
+    // then get the present ones 
+    now_timeSinceLastClock = timeSinceLastClock;
+    now_receivedCounter = receivedCounter;
+
+    // only look at idle state if nothing is moving. 
+    if ((now_timeSinceLastClock == old_timeSinceLastClock) && (now_receivedCounter == old_receivedCounter)) {
+
+      uint32_t now = HAL_GetTick();
+
+      if (now - now_timeSinceLastClock > IDLE_TIMEOUT) { 
+          timeSinceLastClock = now; // reset to avoid message storms. This is NOT safe to do, for the same reasons that the reading is not safe. But making that safe would be rather complicated fpor little gain.
+          if (now_receivedCounter) {
+  #ifdef LOG_DEBUG_MESSAGES
+            printf("%lu - WARNING - IDLE TIMEOUT detected with %u clocks received. This might provoke problems, but it may also be a false alert.\n",now, (unsigned int)now_receivedCounter);
+            // I will not clear receivedCounter, as that could provoke a lot of problems.
+            // Any real errors will be handled in the interrupt handler.
+          } else {
+            printf("%lu - DEBUG - Idle\n",now);
+  #endif
+          }
+      }
+    }
+
+#endif    
   }
   /* USER CODE END 3 */
 }
@@ -152,6 +251,7 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -169,6 +269,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -243,6 +344,8 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -315,16 +418,80 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_SetPriority(EXTI4_15_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
 
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+
+static void MsgBuffer_Init(void) {
+  memset(msgBuffer,0, sizeof(msgBuffer));
+  msgWriteLevel = 0;
+  msgReadLevel = 0;
+}
+
 /*
- * The K2002 clocks out commands at a 2.8 ms interval
+ * Add a merssage to the message queue.
+ * to be called only from the interrupt handler.
  */
-int decode_10channels(uint32_t command, uint32_t *relaySetRegister, uint32_t *relayUnsetRegister) {
+static void MsgBuffer_add(struct msgInfo msg) {
+  memcpy(&(msgBuffer[msgWriteLevel]),&msg,sizeof(msg));
+  msgWriteLevel++;
+}
+
+static void MsgBuffer_print(void) {
+  struct msgInfo msg;
+  // although the protocol only handles 21 bits, I just show all 24 for debugging purposes
+  char outputstate[SCAN2000_20_BITS+2+1]; // 24 + 2 spaces + null
+  while (msgReadLevel != msgWriteLevel) {
+    memcpy(&msg, &(msgBuffer[msgReadLevel]),sizeof(msg));
+    printf("%lu - ", msg.timestamp);
+    int offset = 0;
+    for (uint8_t i=0; i<SCAN2000_20_BITS; i++) {
+      bool b = msg.channelState & (1 << i);
+      if ((i == 10) || (i == 20)) {
+        outputstate[i+offset] = ' ';
+        offset++;
+      }
+      if (b)
+        outputstate[i+offset] = '1';
+      else
+        outputstate[i+offset] = '0';
+    }
+    outputstate[sizeof(outputstate) - 1] = 0;
+    if (msg.state == msgOK) {
+      printf("INFO - OK - %u bit command : 0x" PRI_UINT64 ". Channel state => %s\n", (unsigned int)msg.receivedCounter, PRI_UINT64_C_Val(msg.receivedSequence), outputstate);
+    } else if (msg.state == msgIgnored) {
+      printf("INFO - IG - %u bit NULL command, ignored\n", (unsigned int)msg.receivedCounter);
+    } else if (msg.state == msgLengthError) {
+      printf("ERROR - Message of invalid length - %u bit command, dropping.\n", (unsigned int)msg.receivedCounter);
+    } else if (msg.state == msgDataError) {
+      printf("ERROR - Invalid command - %u bit command : 0x" PRI_UINT64 ", dropping.\n", (unsigned int)msg.receivedCounter, PRI_UINT64_C_Val(msg.receivedSequence));
+    } else if (msg.state == msgRelayError) {
+      printf("ERROR - Invalid relay state - %u bit command : 0x" PRI_UINT64 ". Relay state wanted: %s, dropping\n", (unsigned int)msg.receivedCounter, PRI_UINT64_C_Val(msg.receivedSequence), outputstate);
+    } else {
+      printf("ERROR - Unknown error - %u bit command : 0x" PRI_UINT64 ". Relay state wanted: %s, dropping\n", (unsigned int)msg.receivedCounter, PRI_UINT64_C_Val(msg.receivedSequence), outputstate);
+    }
+    msgReadLevel++;
+  }
+}
+
+typedef enum decodeResult_t {decodeOK = 0, decodeIgnored, decodeDataError, decodeLengthError} decodeResult_t;
+
+/**
+ * @brief Decode 10 channel command
+ * The K2002 clocks out commands at a 2.8 ms interval
+ * @param command Command received
+ * @param relaySetRegister ptr to bitmap for setting relays
+ * @param relayUnsetRegister ptr to bitmap for unsetting relays
+ * @return decodeResult_t
+ */
+decodeResult_t decode_10channels(uint32_t command, uint32_t *relaySetRegister, uint32_t *relayUnsetRegister) {
+    decodeResult_t rv;
     // Check always high bits
     if ((command & SCAN_2000_ALWAYS_HIGH_BITS) != SCAN_2000_ALWAYS_HIGH_BITS) {
-        return 1;
+        return decodeDataError;
     }
     // Remove the bits, that are always high
     command &= ~SCAN_2000_ALWAYS_HIGH_BITS;
@@ -348,36 +515,50 @@ int decode_10channels(uint32_t command, uint32_t *relaySetRegister, uint32_t *re
             // The list of channels, that are to tbe turned off
             *relayUnsetRegister |= !!(command & (1 << scan2000ChannelOffSequence[i])) << (i + (i / 5) * 5);
         }
+        rv = decodeOK;
+    } else {
+        rv = decodeIgnored;
     }
     // Always unset CH6-CH10 and CH-16-CH20
     // There is no need to not set the relaySetRegister, because unsetting a relay takes precidence.
     *relayUnsetRegister |= 0b11111000001111100000;
 
-    return 0;
+    return rv;
 }
 
-int decode_20channels(uint64_t command, uint32_t *relaySetRegister, uint32_t *relayUnsetRegister) {
+/**
+ * @brief Decode 20 channel command
+ * 48 bits in, so I decode all, even when I do not use all
+ * @param command Command received
+ * @param relaySetRegister ptr to bitmap for setting relays
+ * @param relayUnsetRegister ptr to bitmap for unsetting relays
+ * @return decodeResult_t
+ */
+decodeResult_t decode_20channels(uint64_t command, uint32_t *relaySetRegister, uint32_t *relayUnsetRegister) {
     *relaySetRegister = 0x0000;
     *relayUnsetRegister = 0x0000;
 
     // There is no need to run the loop, if there is nothing to do.
     if (command != 0x00000000) {
         // Process the channels (incl. CH21, 4W mode)
-        for (uint8_t i = 0; i < 22; i++) {
-            *relayUnsetRegister |= command & (1 << (2 * (scan2000_20ChannelSequence[i] - 1)));    // Even clock pulses -> turn relays off
-            *relaySetRegister |= command & (1 << (2 * (scan2000_20ChannelSequence[i] - 1) + 1));  // Odd clock pulses -> turn relays on
+        for (uint8_t i = 0; i < SCAN2000_20_BITS; i++) {
+          if ((command & ((uint64_t)1<<(2*i))) !=0) // Even clock pulses -> turn relays off
+            *relayUnsetRegister |= ((uint32_t)1<<(scan2000_20ChannelSequence[i]-1));
+          if ((command & ((uint64_t)1<<((2*i)+1))) !=0) // Odd clock pulses -> turn relays on
+            *relaySetRegister |= ((uint32_t)1<<(scan2000_20ChannelSequence[i]-1));
         }
-    }
-    return 0;
+        return decodeOK;
+    } else
+        return decodeIgnored;
 }
 
 bool validateRelayState(uint32_t channelState) {
     // A valid state is the following:
     // - If the the two relay banks are connected, only one relay may be opened
     // - If the banks are disconnected (4W mode), one relay in each bank may be connected
-    int countBank1 = __builtin_popcountl(channelState & 0x003FF);
-    int countBank2 = __builtin_popcountl(channelState & 0xFFC00);
-    bool ch21Enabled = (0x100000 & channelState);
+    int countBank1 = __builtin_popcountl(channelState & CHANNELSTATE_BITMASK_BANK1);
+    int countBank2 = __builtin_popcountl(channelState & CHANNELSTATE_BITMASK_BANK2);
+    bool ch21Enabled = (CHANNELSTATE_BITMASK_4W & channelState);
     return
         (!ch21Enabled && (countBank1 + countBank2 <= 1))   // If "CH21" (4W Relay) is disabled
         || (ch21Enabled && (countBank1 <= 1 && countBank2 <= 1)); // If "CH21" (4W Relay) is enabled
@@ -389,25 +570,26 @@ void setRelays(uint32_t newChannelState) {
         channelState = newChannelState;
 
         // First disconnect all channels, that need to be disconnected
-        for (uint8_t i=0; i<21; i++) {
+        for (uint8_t i=0; i<NR_CHANNELS; i++) {
             if (!(channelState & (1 << i))) {
                 HAL_GPIO_WritePin(GPIOsequence[i], PinSequence[i], GPIO_PIN_RESET);
             }
         }
 
-        // If CH11-CH20 are turned off, disconect them from the all buses to reduce the isolation capacitance
+        // If CH11-CH20 are turned off, disconnect them from the all buses to reduce the isolation capacitance
         // else connect it either to the 4W output or the sense output
-        if (!(channelState & 0xFFC00)) {
+        if (!(channelState & CHANNELSTATE_BITMASK_BANK2)) {
             HAL_GPIO_WritePin(Bus_Sense_GPIO_Port, Bus_Sense_Pin, GPIO_PIN_RESET);
             HAL_GPIO_WritePin(Bus_In_GPIO_Port, Bus_In_Pin, GPIO_PIN_RESET);
         } else {
-            HAL_GPIO_WritePin(Bus_Sense_GPIO_Port, Bus_Sense_Pin, !(channelState & (1 << 20)));       // TODO: Check if that channel setting is sent
-            HAL_GPIO_WritePin(Bus_In_GPIO_Port, Bus_In_Pin, !!(channelState & (1 << 20)));
+            bool bit_4W = (channelState & CHANNELSTATE_BITMASK_4W);
+            HAL_GPIO_WritePin(Bus_Sense_GPIO_Port, Bus_Sense_Pin, bit_4W);
+            HAL_GPIO_WritePin(Bus_In_GPIO_Port, Bus_In_Pin, !bit_4W);
         }
 
         // Finally connect all channels, that need to be connected
-        for (uint8_t i=0; i<21; i++) {
-            if (channelState & (1 << 20)) {
+        for (uint8_t i=0; i<NR_CHANNELS; i++) {
+            if (channelState & (1 << i)) {
                 HAL_GPIO_WritePin(GPIOsequence[i], PinSequence[i], GPIO_PIN_SET);
             }
         }
@@ -415,74 +597,79 @@ void setRelays(uint32_t newChannelState) {
 }
 
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin) {
+#ifdef LOG_DEBUG_MESSAGES  
+    // debug duration of the interrupt handler through the led line
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); // led on
+#endif
+
     if (GPIO_Pin == Clock_Pin) {
         // Clock in a new bit
         receivedSequence = receivedSequence << 1;
-        receivedSequence |= HAL_GPIO_ReadPin(Bus_Sense_GPIO_Port, Bus_Sense_Pin);
+        receivedSequence |= HAL_GPIO_ReadPin(Data_GPIO_Port, Data_Pin);
         receivedCounter++;
         timeSinceLastClock = HAL_GetTick();
     } else if (GPIO_Pin == Strobe_Pin) {
+#ifndef LOG_DEBUG_MESSAGES      
         // The sequence is over, decode it now
-        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-        uartbuffer[0] = '\0';
-        uint32_t newChannelState = channelState;
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin); // toggle the led, every message
+#endif        
+        struct msgInfo msg;
+        msg.state = msgUnknown;
+        msg.timestamp = HAL_GetTick();
+        msg.receivedCounter = receivedCounter;
+        msg.receivedSequence = receivedSequence;
+        msg.channelState = 0; // just a default value. Will be overwritten when possible.
 
-        if (receivedCounter == 24) {
+        uint32_t newChannelState = channelState;
+        uint32_t relaySetRegister = 0x00,  relayUnsetRegister = 0x00;
+        decodeResult_t decodeResult = decodeLengthError; // error state by default
+
+        if (receivedCounter == (BITS_FOR_SCAN2000_STD * 2)) {
             // We have a command for a 10 channel SCAN2000/SCAN2001 card
-            uint32_t relaySetRegister = 0x00,  relayUnsetRegister = 0x00;
-            int result = decode_10channels((uint32_t)receivedSequence, &relaySetRegister, &relayUnsetRegister);
-            if (result) {
-                // Terminate here and print an error
-                sprintf((char *)uartsinglemessage, "Error. Invalid command received: 0x%llx\nDropping command.\n", receivedSequence);
-                strcat((char *)uartbuffer, (char *)uartsinglemessage);
-            } else {
-                // Now apply the updates
-                newChannelState |= relaySetRegister;    // closed channels
-                newChannelState &= ~relayUnsetRegister; // opened channels
-            }
-        } else if (receivedCounter == 48) {
-            uint32_t relaySetRegister = 0x00,  relayUnsetRegister = 0x00;
-            decode_20channels((uint32_t)receivedSequence, &relaySetRegister, &relayUnsetRegister);
-            // Now apply the updates
-            newChannelState |= relaySetRegister;    // closed channels
-            newChannelState &= ~relayUnsetRegister; // opened channels
+            decodeResult = decode_10channels((uint32_t)receivedSequence, &relaySetRegister, &relayUnsetRegister);
+        } else if (receivedCounter == (SCAN2000_20_BITS * 2)) {
+            decodeResult = decode_20channels((uint64_t)receivedSequence, &relaySetRegister, &relayUnsetRegister);
         } else {
             // Do not process the command, if it is of unknown size
-            sprintf((char *)uartsinglemessage, "Error. Invalid command length: %u\nDropping command.\n", receivedCounter);
-            strcat((char *)uartbuffer, (char *)uartsinglemessage);
+            decodeResult = decodeLengthError;
         }
 
-        // Test if the new state is valid and if so, apply it
-        bool validState = validateRelayState(newChannelState);
+        if ((decodeResult == decodeOK) || (decodeResult == decodeIgnored)) {
+            // Now apply the updates (can happen even when command is ignored, as I unset unwanted relays by default)
+            newChannelState |= relaySetRegister;    // closed channels
+            newChannelState &= ~relayUnsetRegister; // opened channels
+            if (decodeResult == decodeOK)
+                msg.state = msgOK;
+            else
+                msg.state = msgIgnored;
 
-        if (validState) {
-            setRelays(newChannelState);
-            // sprintf((char *)uartsinglemessage, "Relay state, 0x%lx\n", channelState);
-            // strcat((char *)uartbuffer, (char *)uartsinglemessage);
+            // Test if the new state is valid and if so, apply it
+            if (validateRelayState(newChannelState)) {
+                setRelays(newChannelState);                  
+            } else {
+                msg.state = msgRelayError;
+            }
         } else {
-            sprintf((char *)uartsinglemessage, "Error. Invalid relay state: 0x%lx\nDropping command.\n", newChannelState);
-            strcat((char *)uartbuffer, (char *)uartsinglemessage);
+            // very likely decodeResult == decodeXError
+            // Terminate here and signal an error
+            if (decodeResult == decodeDataError)       
+                msg.state = msgDataError;
+            else
+                msg.state = msgLengthError;
         }
 
+        // signal the message to the print/log loop
+        msg.channelState = newChannelState;
+        MsgBuffer_add(msg);
+
+        // and init for the next command
         receivedSequence = 0x00;
         receivedCounter = 0;
-        if (uartbuffer[0] != '\0') {
-            UARTSendDMA();
-        }
     }
-}
-
-void UARTSendDMA(void) {
-    // Block until the previous transmission is complete.
-    // In the meantime the uartTransmitBuffer will keep buffering
-    // all output
-    while(__HAL_UART_GET_FLAG(&huart4, UART_FLAG_TC) != 1);
-    strcpy((char *)uartTransmitBuffer, (char *)uartbuffer);
-    HAL_UART_Transmit_DMA(
-        &huart4,
-        uartTransmitBuffer,
-        strlen((char *)uartTransmitBuffer)
-    );
+#ifdef LOG_DEBUG_MESSAGES    
+    // debug duration of the interrupt handler through the led line
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET); // led off
+#endif    
 }
 
 int _write(int file, char *ptr, int len)
@@ -543,4 +730,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
